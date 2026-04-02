@@ -102,6 +102,12 @@ func (CcsAwsSession *ccsAwsSession) CleanupVPCs(activeClusters map[string]bool, 
 		fmt.Printf("Attempting to delete CloudFormation stack: %s\n", stackName)
 
 		if !dryrun {
+			// Workaround: Delete leftover security groups before deleting the stack
+			if err := CcsAwsSession.cleanupVPCSecurityGroups(cfnClient, stackName); err != nil {
+				log.Printf("Warning: failed to cleanup security groups for %s: %v\n", stackName, err)
+				// Continue with stack deletion even if SG cleanup fails
+			}
+
 			_, err := cfnClient.DeleteStack(&cloudformation.DeleteStackInput{
 				StackName: aws.String(stackName),
 			})
@@ -148,4 +154,74 @@ func getClusterNameFromVPCName(vpcName string) string {
 	}
 	// If pattern doesn't match, return original name
 	return vpcName
+}
+
+// cleanupVPCSecurityGroups deletes leftover security groups in the VPC before stack deletion
+// Workaround for https://issues.redhat.com/browse/OCPBUGS-74960
+// TODO: Remove the workaround once the bug is fixed
+func (CcsAwsSession *ccsAwsSession) cleanupVPCSecurityGroups(cfnClient *cloudformation.CloudFormation, stackName string) error {
+	// Get VPC ID from stack outputs
+	stackOutput, err := cfnClient.DescribeStacks(&cloudformation.DescribeStacksInput{
+		StackName: aws.String(stackName),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to describe stack: %v", err)
+	}
+
+	if len(stackOutput.Stacks) == 0 {
+		return fmt.Errorf("stack not found")
+	}
+
+	var vpcID string
+	for _, output := range stackOutput.Stacks[0].Outputs {
+		if output.OutputKey != nil && *output.OutputKey == "VPCId" {
+			if output.OutputValue != nil {
+				vpcID = *output.OutputValue
+				break
+			}
+		}
+	}
+
+	if vpcID == "" {
+		return fmt.Errorf("VPC ID not found in stack outputs")
+	}
+
+	log.Printf("Cleaning up security groups in VPC: %s\n", vpcID)
+
+	// List all security groups in the VPC with vpce-private-router in the name
+	result, err := CcsAwsSession.ec2.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("vpc-id"),
+				Values: []*string{aws.String(vpcID)},
+			},
+			{
+				Name:   aws.String("group-name"),
+				Values: []*string{aws.String("*vpce-private-router*")},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to describe security groups: %v", err)
+	}
+
+	// Delete security groups matching vpce-private-router
+	for _, sg := range result.SecurityGroups {
+		if sg.GroupId == nil {
+			continue
+		}
+
+		log.Printf("Deleting vpce-private-router security group: %s (name: %s)\n", *sg.GroupId, aws.StringValue(sg.GroupName))
+
+		// Delete the security group
+		_, err := CcsAwsSession.ec2.DeleteSecurityGroup(&ec2.DeleteSecurityGroupInput{
+			GroupId: sg.GroupId,
+		})
+		if err != nil {
+			log.Printf("Failed to delete security group %s: %v\n", *sg.GroupId, err)
+			// Continue to try deleting other security groups
+		}
+	}
+
+	return nil
 }
